@@ -76,6 +76,7 @@ init_db()
 
 # --- Utility functions ---
 def get_tags():
+    """Get all the Tags"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT name FROM tags")
@@ -135,6 +136,7 @@ def get_contribution_color(level):
 # --- Commands ---
 @app.command()
 def add_tag(name: str):
+    """Create a new tag for categorizing time tracking sessions."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     try:
@@ -149,6 +151,7 @@ def add_tag(name: str):
 
 @app.command()
 def tags():
+    """List all available tags."""
     tag_list = get_tags()
     table = Table(
         title="Tags",
@@ -165,6 +168,7 @@ def tags():
 
 @app.command()
 def start():
+    """Start a new time tracking session."""
     tag_list = get_tags()
     if not tag_list:
         console.print(
@@ -200,6 +204,7 @@ def start():
 
 @app.command()
 def stop():
+    """Stop the currently active time tracking session"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute(
@@ -226,6 +231,7 @@ def stop():
 
 @app.command()
 def summary():
+    """Get Summary and Analytics of your sessions"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute(
@@ -261,6 +267,7 @@ def summary():
 
 @app.command()
 def streak():
+    """Analyze and display streak information for each tag"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute(
