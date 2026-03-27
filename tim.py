@@ -15,6 +15,8 @@ import typer
 from prompt_toolkit import prompt
 from prompt_toolkit.completion import FuzzyWordCompleter
 import calendar
+import subprocess
+import json
 
 app = typer.Typer()
 console = Console()
@@ -133,7 +135,396 @@ def get_contribution_color(level):
     return colors.get(level, CATPPUCCIN["surface0"])
 
 
-# --- Commands ---
+def show_current_status():
+    """Show current active session status with elapsed time"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        """SELECT sessions.id, tags.name, sessions.start 
+           FROM sessions 
+           JOIN tags ON sessions.tag_id = tags.id 
+           WHERE sessions.end IS NULL 
+           ORDER BY sessions.id DESC 
+           LIMIT 1"""
+    )
+    row = c.fetchone()
+    conn.close()
+    
+    if not row:
+        console.print(
+            Panel(
+                f"[bold {CATPPUCCIN['yellow']}]No active session[/]\n\nUse [bold]tim start[/] to begin tracking time",
+                title="tim — Status",
+                style=CATPPUCCIN["surface1"],
+                box=box.ROUNDED,
+            )
+        )
+        return
+    
+    session_id, tag_name, start_str = row
+    start_dt = datetime.fromisoformat(start_str)
+    now = datetime.now(timezone.utc)
+    elapsed = now - start_dt
+    
+    # Format elapsed time
+    total_seconds = int(elapsed.total_seconds())
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    
+    if hours > 0:
+        duration_str = f"{hours}h {minutes}m {seconds}s"
+    else:
+        duration_str = f"{minutes}m {seconds}s"
+    
+    # Format start time in a more readable way
+    start_formatted = start_dt.strftime("%Y-%m-%d %H:%M:%S")
+    
+    status_content = f"""[bold {CATPPUCCIN['green']}]● ACTIVE SESSION[/]
+
+[bold]Tag:[/] {tag_name}
+[bold]Session ID:[/] {session_id}
+[bold]Started:[/] {start_formatted}
+[bold]Elapsed:[/] [bold {CATPPUCCIN['yellow']}]{duration_str}[/]
+
+Use [bold]tim stop[/] to end this session"""
+
+    console.print(
+        Panel(
+            status_content,
+            title=f"tim — {tag_name}",
+            style=CATPPUCCIN["surface1"],
+            box=box.ROUNDED,
+        )
+    )
+
+
+# --- TMUX Integration Functions ---
+def get_current_session_info():
+    """Get current session info for tmux status bar"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        """SELECT sessions.id, tags.name, sessions.start 
+           FROM sessions 
+           JOIN tags ON sessions.tag_id = tags.id 
+           WHERE sessions.end IS NULL 
+           ORDER BY sessions.id DESC 
+           LIMIT 1"""
+    )
+    row = c.fetchone()
+    conn.close()
+    
+    if not row:
+        return None
+    
+    session_id, tag_name, start_str = row
+    start_dt = datetime.fromisoformat(start_str)
+    now = datetime.now(timezone.utc)
+    elapsed = now - start_dt
+    
+    total_seconds = int(elapsed.total_seconds())
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, _ = divmod(remainder, 60)
+    
+    return {
+        "tag": tag_name,
+        "elapsed_hours": hours,
+        "elapsed_minutes": minutes,
+        "total_seconds": total_seconds
+    }
+
+
+def get_today_total():
+    """Get today's total tracked time in minutes"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    today_str = date.today().isoformat()
+    
+    # Get completed sessions from today
+    c.execute(
+        """SELECT start, end FROM sessions 
+           WHERE date(start) = ? AND end IS NOT NULL""",
+        (today_str,)
+    )
+    completed = c.fetchall()
+    
+    # Get active session if it started today
+    c.execute(
+        """SELECT start FROM sessions 
+           WHERE date(start) = ? AND end IS NULL""",
+        (today_str,)
+    )
+    active = c.fetchone()
+    
+    conn.close()
+    
+    total_minutes = 0
+    
+    # Add completed sessions
+    for start_str, end_str in completed:
+        start_dt = datetime.fromisoformat(start_str)
+        end_dt = datetime.fromisoformat(end_str)
+        duration = (end_dt - start_dt).total_seconds() / 60
+        total_minutes += duration
+    
+    # Add active session time if exists
+    if active:
+        start_dt = datetime.fromisoformat(active[0])
+        now = datetime.now(timezone.utc)
+        duration = (now - start_dt).total_seconds() / 60
+        total_minutes += duration
+    
+    return total_minutes
+
+
+def format_duration_short(minutes):
+    """Format duration in short format for status bar"""
+    if minutes < 60:
+        return f"{int(minutes)}m"
+    else:
+        hours = int(minutes // 60)
+        mins = int(minutes % 60)
+        return f"{hours}h{mins}m" if mins > 0 else f"{hours}h"
+
+
+def get_activity_color_tmux(minutes):
+    """Get tmux color for activity level"""
+    if minutes == 0:
+        return "colour240"  # Gray
+    elif minutes < 30:
+        return "colour108"  # Light green
+    elif minutes < 60:
+        return "colour107"  # Green
+    elif minutes < 120:
+        return "colour109"  # Teal
+    else:
+        return "colour111"  # Blue
+
+
+@app.command()
+def tmux_status():
+    """Generate tmux status bar content"""
+    current = get_current_session_info()
+    today_total = get_today_total()
+    
+    if current:
+        if current["elapsed_hours"] > 0:
+            elapsed = f"{current['elapsed_hours']}h{current['elapsed_minutes']}m"
+        else:
+            elapsed = f"{current['elapsed_minutes']}m"
+        
+        status = f"🔴 {current['tag']} {elapsed}"
+    else:
+        status = "⚫ No active session"
+    
+    # Add today's total
+    total_str = format_duration_short(today_total)
+    color = get_activity_color_tmux(today_total)
+    
+    # Output in tmux format
+    print(f"{status} | Today: {total_str}")
+
+
+@app.command()
+def tmux_status_color():
+    """Get tmux status bar color based on today's activity"""
+    today_total = get_today_total()
+    color = get_activity_color_tmux(today_total)
+    print(color)
+
+
+@app.command()
+def tmux_quick_start():
+    """Quick start with fzf tag selection for tmux"""
+    tag_list = get_tags()
+    if not tag_list:
+        print("❌ No tags available!")
+        print("Add a tag first with: tim add-tag <tagname>")
+        print("\nExample: tim add-tag study")
+        return
+    
+    print("🏷️  Available tags:")
+    for i, tag in enumerate(tag_list, 1):
+        print(f"  {i}. {tag}")
+    print()
+    
+    # Try fzf first, fall back to manual input
+    selected_tag = None
+    try:
+        result = subprocess.run(
+            ["fzf", "--prompt", "⏰ Select tag: ", "--height", "~40%", "--reverse"],
+            input="\n".join(tag_list),
+            text=True,
+            capture_output=True
+        )
+        
+        if result.returncode == 0:
+            selected_tag = result.stdout.strip()
+    except FileNotFoundError:
+        pass  # fzf not available, fall back to manual selection
+    
+    # If fzf didn't work or user canceled, ask manually
+    if not selected_tag:
+        try:
+            selected_tag = input("⏰ Enter tag name (or number): ").strip()
+            
+            # Handle numeric input
+            if selected_tag.isdigit():
+                idx = int(selected_tag) - 1
+                if 0 <= idx < len(tag_list):
+                    selected_tag = tag_list[idx]
+                else:
+                    print("❌ Invalid number!")
+                    return
+        except (KeyboardInterrupt, EOFError):
+            print("\n❌ Cancelled")
+            return
+    
+    if not selected_tag:
+        print("❌ No tag selected")
+        return
+    
+    # Validate tag exists
+    if selected_tag not in tag_list:
+        print(f"❌ Tag '{selected_tag}' not found!")
+        print("Available tags:", ", ".join(tag_list))
+        return
+    
+    # Start session
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT tags.id FROM tags WHERE tags.name=?", (selected_tag,))
+    row = c.fetchone()
+    
+    if not row:
+        print(f"❌ Tag not found in database: {selected_tag}")
+        return
+        
+    tag_id = row[0]
+    
+    # Check if there's already an active session
+    c.execute("SELECT sessions.id, tags.name FROM sessions JOIN tags ON sessions.tag_id = tags.id WHERE sessions.end IS NULL")
+    active = c.fetchone()
+    
+    if active:
+        print(f"⚠️  Already tracking: {active[1]}")
+        response = input("Stop current session and start new one? (y/N): ").strip().lower()
+        if response != 'y':
+            conn.close()
+            return
+        
+        # Stop current session
+        now = datetime.now(timezone.utc)
+        c.execute("UPDATE sessions SET end=? WHERE sessions.id=?", (now.isoformat(), active[0]))
+        print(f"⏹️  Stopped tracking: {active[1]}")
+
+    start = datetime.now(timezone.utc).isoformat()
+    c.execute("INSERT INTO sessions(tag_id, start) VALUES (?, ?)", (tag_id, start))
+    conn.commit()
+    sid = c.lastrowid
+    conn.close()
+
+    print(f"✅ Started tracking: {selected_tag}")
+    print(f"📊 Session ID: {sid}")
+    print(f"⏰ Started at: {datetime.now().strftime('%H:%M:%S')}")
+    print("\n💡 Use 'tim stop' or 'prefix + C-o' to stop tracking")
+
+
+@app.command()
+def tmux_summary_popup():
+    """Generate summary for tmux popup"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        """SELECT tags.name, start, end FROM sessions 
+           JOIN tags ON sessions.tag_id=tags.id 
+           ORDER BY start DESC LIMIT 10"""
+    )
+    rows = c.fetchall()
+    conn.close()
+
+    print("╭─ Recent Sessions ─────────────────────────────────╮")
+    print("│ Tag          │ Start    │ End      │ Duration   │")
+    print("├──────────────┼──────────┼──────────┼────────────┤")
+    
+    for tag, start, end in rows:
+        start_time = datetime.fromisoformat(start).strftime("%H:%M")
+        
+        if end:
+            end_time = datetime.fromisoformat(end).strftime("%H:%M")
+            start_dt = datetime.fromisoformat(start)
+            end_dt = datetime.fromisoformat(end)
+            dur = end_dt - start_dt
+            h, rem = divmod(dur.seconds, 3600)
+            m, _ = divmod(rem, 60)
+            duration_str = f"{h:2d}h {m:2d}m"
+        else:
+            end_time = "Active"
+            duration_str = "Running..."
+        
+        # Truncate tag name if too long
+        display_tag = tag[:12] if len(tag) <= 12 else tag[:9] + "..."
+        
+        print(f"│ {display_tag:<12} │ {start_time:<8} │ {end_time:<8} │ {duration_str:<10} │")
+    
+    print("╰───────────────────────────────────────────────────╯")
+    
+    # Show today's total
+    today_total = get_today_total()
+    total_str = format_duration_short(today_total)
+    print(f"\nToday's total: {total_str}")
+    
+    # Show current status
+    current = get_current_session_info()
+    if current:
+        elapsed = f"{current['elapsed_hours']}h {current['elapsed_minutes']}m" if current["elapsed_hours"] > 0 else f"{current['elapsed_minutes']}m"
+        print(f"Active: {current['tag']} ({elapsed})")
+    else:
+        print("No active session")
+
+
+@app.command()
+def tmux_menu_tags():
+    """Generate tmux menu format for tag selection"""
+    tags = get_tags()
+    if not tags:
+        print("'No Tags' '' 'display-message \"No tags available. Use: tim add-tag NAME\"'")
+        return
+    
+    for i, tag in enumerate(tags):
+        # Escape quotes and create tmux menu format
+        escaped_tag = tag.replace("'", "\\'")
+        print(f"'{escaped_tag}' '{i+1}' 'run-shell \"tim tmux-start-tag {escaped_tag}\"'")
+
+
+@app.command()
+def tmux_start_tag(tag_name: str):
+    """Start tracking with specific tag (for tmux integration)"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT tags.id FROM tags WHERE tags.name=?", (tag_name,))
+    row = c.fetchone()
+    if not row:
+        print(f"Tag not found: {tag_name}")
+        return
+    tag_id = row[0]
+
+    start = datetime.now(timezone.utc).isoformat()
+    c.execute("INSERT INTO sessions(tag_id, start) VALUES (?, ?)", (tag_id, start))
+    conn.commit()
+    conn.close()
+
+    print(f"Started tracking: {tag_name}")
+
+
+# --- Commands (existing functionality unchanged) ---
+@app.callback(invoke_without_command=True)
+def main(ctx: typer.Context):
+    """A timew-inspired study tracker. Shows current session status when called without arguments."""
+    if ctx.invoked_subcommand is None:
+        show_current_status()
+
+
 @app.command()
 def add_tag(name: str):
     """Create a new tag for categorizing time tracking sessions."""
@@ -180,7 +571,7 @@ def start():
 
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT id FROM tags WHERE name=?", (tag_name,))
+    c.execute("SELECT tags.id FROM tags WHERE tags.name=?", (tag_name,))
     row = c.fetchone()
     if not row:
         console.print(f"[bold {CATPPUCCIN['red']}]Tag not found")
@@ -208,7 +599,7 @@ def stop():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute(
-        "SELECT id, start FROM sessions WHERE end IS NULL ORDER BY id DESC LIMIT 1"
+        "SELECT sessions.id, sessions.start FROM sessions WHERE sessions.end IS NULL ORDER BY sessions.id DESC LIMIT 1"
     )
     row = c.fetchone()
     if not row:
@@ -217,7 +608,7 @@ def stop():
     sid, start = row
     start_dt = datetime.fromisoformat(start)
     now = datetime.now(timezone.utc)
-    c.execute("UPDATE sessions SET end=? WHERE id=?", (now.isoformat(), sid))
+    c.execute("UPDATE sessions SET end=? WHERE sessions.id=?", (now.isoformat(), sid))
     conn.commit()
     conn.close()
 
